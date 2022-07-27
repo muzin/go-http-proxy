@@ -2,7 +2,6 @@ package go_http_proxy
 
 import (
 	"crypto/tls"
-	"github.com/gorilla/websocket"
 	"github.com/muzin/go_rt/events"
 	"github.com/muzin/go_rt/try"
 	"net"
@@ -18,15 +17,15 @@ type ProxyServer struct {
 
 	web func(response http.ResponseWriter, request *http.Request)
 
-	ws func(request *http.Request, conn *websocket.Conn)
-
 	proxyReqFunc func(proxyReq *http.Request, request *http.Request, response http.ResponseWriter, options *ProxyServerOptions)
 
-	proxyRespFunc func(proxyResp *http.Response, request *http.Request, response http.ResponseWriter, options *ProxyServerOptions)
+	proxyRespFunc func(proxyResp *http.Response)
 
 	proxyErrorFunc func(resp http.ResponseWriter, req *http.Request, err error)
 
 	options *ProxyServerOptions
+
+	proxy *httputil.ReverseProxy
 }
 
 func (this *ProxyServer) onError(args ...interface{}) {
@@ -44,75 +43,9 @@ func (this *ProxyServer) onError(args ...interface{}) {
 // @param extOptions *ProxyServerOptions
 func (this *ProxyServer) Web(response http.ResponseWriter, request *http.Request, args ...interface{}) {
 
-	var extOptions *ProxyServerOptions = nil
-	if len(args) > 0 {
-		extOptions = args[0].(*ProxyServerOptions)
-	} else {
-		extOptions = this.options
+	if this.proxy != nil {
+		this.proxy.ServeHTTP(response, request)
 	}
-
-	target := extOptions.Target
-	u, _ := urlpkg.Parse(target)
-
-	requestUrl := request.URL
-
-	targetUrl := &urlpkg.URL{
-		Scheme: u.Scheme,
-		Opaque: requestUrl.Opaque,
-		User:   requestUrl.User,
-		Host:   u.Host,
-		//Path:        u.Path + requestUrl.Path,
-		Path:        u.Path,
-		RawPath:     requestUrl.RawPath,
-		ForceQuery:  requestUrl.ForceQuery,
-		RawQuery:    requestUrl.RawQuery,
-		Fragment:    requestUrl.Fragment,
-		RawFragment: requestUrl.RawFragment,
-	}
-	request.Host = u.Host
-
-	proxy := httputil.NewSingleHostReverseProxy(targetUrl)
-	var tlsConfig = &tls.Config{
-		InsecureSkipVerify: !extOptions.Secure, // 忽略证书验证
-	}
-	var transport http.RoundTripper = &http.Transport{
-		Proxy: nil, // 不使用代理，如果想使用系统代理，请使用 http.ProxyFromEnvironment
-		DialContext: (&net.Dialer{
-			Timeout:   extOptions.ProxyTimeout,
-			KeepAlive: extOptions.KeepAlive,
-		}).DialContext,
-		MaxIdleConns:          extOptions.MaxIdleConns,
-		IdleConnTimeout:       extOptions.IdleConnTimeout,
-		TLSHandshakeTimeout:   extOptions.TLSHandshakeTimeout,
-		ExpectContinueTimeout: extOptions.ExpectContinueTimeout,
-		TLSClientConfig:       tlsConfig,
-		DisableCompression:    extOptions.DisableCompression,
-	}
-	proxy.Transport = transport
-	proxy.ModifyResponse = func(r *http.Response) error {
-		r.Header.Del("X-Frame-Options") // 重点：代理时移除 X-Frame-Options 头
-		if !extOptions.Xfwd {
-			r.Header.Del("X-Forwarded-For") // Xfwd为false时, 移除 X-Forwarded-For 头
-		}
-
-		// 如果 存在 附加 Header
-		if extOptions.Headers != nil && len(extOptions.Headers) > 0 {
-			for key, value := range extOptions.Headers {
-				r.Header.Add(key, value)
-			}
-		}
-
-		if this.proxyRespFunc != nil {
-			this.proxyRespFunc(r, request, response, extOptions)
-		}
-		return nil
-	}
-	// Proxy Error Handler
-	if this.proxyErrorFunc != nil {
-		proxy.ErrorHandler = this.proxyErrorFunc
-	}
-
-	proxy.ServeHTTP(response, request)
 
 }
 
@@ -174,11 +107,7 @@ func (this *ProxyServer) OnProxyReqWs(listener func(proxyReq *http.Request,
 //
 // @param listener func(listener func(proxyReq *http.Request, request *http.Request, response http.ResponseWriter, options *ProxyServerOptions)
 //
-func (this *ProxyServer) OnProxyResp(listener func(proxyResp *http.Response,
-	request *http.Request,
-	response http.ResponseWriter,
-	options *ProxyServerOptions,
-)) {
+func (this *ProxyServer) OnProxyResp(listener func(proxyResp *http.Response)) {
 	this.proxyRespFunc = listener
 }
 
@@ -229,10 +158,74 @@ func (this *ProxyServer) createProxyRequestByRequest(request *http.Request) *htt
 	return newRequest
 }
 
+func (this *ProxyServer) initHttpProxy() {
+
+	extOptions := this.options
+
+	target := extOptions.Target
+	targetUrl, _ := urlpkg.Parse(target)
+
+	proxy := httputil.NewSingleHostReverseProxy(targetUrl)
+	var tlsConfig = &tls.Config{
+		InsecureSkipVerify: !extOptions.Secure, // 忽略证书验证
+	}
+	var transport http.RoundTripper = &http.Transport{
+		Proxy: nil, // 不使用代理，如果想使用系统代理，请使用 http.ProxyFromEnvironment
+		DialContext: (&net.Dialer{
+			Timeout:   extOptions.ProxyTimeout,
+			KeepAlive: extOptions.KeepAlive,
+		}).DialContext,
+		MaxIdleConns:          extOptions.MaxIdleConns,
+		IdleConnTimeout:       extOptions.IdleConnTimeout,
+		TLSHandshakeTimeout:   extOptions.TLSHandshakeTimeout,
+		ExpectContinueTimeout: extOptions.ExpectContinueTimeout,
+		TLSClientConfig:       tlsConfig,
+		DisableCompression:    extOptions.DisableCompression,
+	}
+	proxy.Transport = transport
+	proxy.ModifyResponse = func(r *http.Response) error {
+		r.Header.Del("X-Frame-Options") // 重点：代理时移除 X-Frame-Options 头
+		if !extOptions.Xfwd {
+			r.Header.Del("X-Forwarded-For") // Xfwd为false时, 移除 X-Forwarded-For 头
+		}
+
+		// 如果 存在 附加 Header
+		if extOptions.Headers != nil && len(extOptions.Headers) > 0 {
+			for key, value := range extOptions.Headers {
+				r.Header.Add(key, value)
+			}
+		}
+
+		if this.proxyRespFunc != nil {
+			this.proxyRespFunc(r)
+		}
+		return nil
+	}
+	//proxy.Director = func(request *http.Request) {
+	//	if str.IsNotBlank(extOptions.HostRewrite) {
+	//
+	//	}
+	//}
+
+	// Proxy Error Handler
+	if this.proxyErrorFunc != nil {
+		proxy.ErrorHandler = this.proxyErrorFunc
+	}
+
+	this.proxy = proxy
+
+}
+
+func (this *ProxyServer) GetOptions() *ProxyServerOptions {
+	return this.options
+}
+
+func (this *ProxyServer) RefreshOptions() {
+	this.initHttpProxy()
+}
+
 type DefaultHttpProxyHandler struct {
 	webHandler func(response http.ResponseWriter, request *http.Request)
-
-	upgrader websocket.Upgrader
 }
 
 func (this *DefaultHttpProxyHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -252,6 +245,8 @@ func NewProxyServer(options *ProxyServerOptions) *ProxyServer {
 	}
 
 	proxyServer.On("error", proxyServer.onError)
+
+	proxyServer.initHttpProxy()
 
 	return proxyServer
 }
