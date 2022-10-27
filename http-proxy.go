@@ -170,7 +170,7 @@ func (this *ProxyServer) initHttpProxy() {
 		InsecureSkipVerify: !extOptions.Secure, // 忽略证书验证
 	}
 	var transport http.RoundTripper = &http.Transport{
-		Proxy: nil, // 不使用代理，如果想使用系统代理，请使用 http.ProxyFromEnvironment
+		Proxy: http.ProxyFromEnvironment, // 不使用代理，如果想使用系统代理，请使用 http.ProxyFromEnvironment
 		DialContext: (&net.Dialer{
 			Timeout:   extOptions.ProxyTimeout,
 			KeepAlive: extOptions.KeepAlive,
